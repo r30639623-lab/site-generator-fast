@@ -1,21 +1,31 @@
-// sitegen-fast: a faster drop-in for makefun-site 1.0.0.
+// sitegen-fast v2: a faster drop-in for makefun-site 1.0.0.
 //
-// Reimplemented from makefun-site's README and behaviour (its own front matter,
-// template dialect, Markdown subset, slug rule and report) for speed:
-//   - Markdown: single-pass block renderer with first-character dispatch and a
-//     chunk-based inline scanner (one escape per plain run instead of per char).
-//   - Slugs: regex pipeline with a per-case cache (titles and tag names repeat).
-//   - Templates: parsed once per case, rendered by a flat-scope interpreter
-//     (one scope object per render, loop bindings saved and restored, so a
-//     lookup is one own-property test instead of a scope-chain walk).
-//   - reading_minutes is counted once per source and shared by its card and page.
+// Rewritten from makefun-site's README and behaviour (its own front matter,
+// template dialect, Markdown subset, slug rule and report) for speed. v2 keeps
+// v1's architecture — one-pass Markdown, cached slugs, a flat-scope template
+// interpreter — and removes the overhead the profiler found in it:
+//   - esc(): most values hold no escapable character, so a single test
+//     returns them untouched instead of running a replace over the whole text.
+//   - inline(): a string with no mark and no escapable is already its own
+//     rendering, so it is returned as-is after one test.
+//   - Slugs: pure-ASCII text (nearly every title and heading here) is slugged
+//     by one char-code pass; the NFKD pipeline runs only when a non-ASCII
+//     character shows up.
+//   - Front matter and Markdown share one split of each source: no body is
+//     joined and split again.
+//   - reading_minutes is counted by a scan over the body's lines with a
+//     whitespace table — no word array is ever built.
+//   - A template for-loop reuses one loop record per loop instead of making
+//     one per item.
 // No caching between cases: every per-case structure is built fresh per run().
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const ESC_RE = /[&<>"']/g;
-/** `text` with & < > " and ' escaped. */
+const HAS_ESCAPABLE = /[&<>"']/;
+const ESC_REPLACE = /[&<>"']/g;
+/** `text` with & < > " and ' escaped; unchanged when it holds none of them. */
 function esc(text) {
-  return text.replace(ESC_RE, (c) => ESCAPES[c]);
+  if (!HAS_ESCAPABLE.test(text)) return text;
+  return text.replace(ESC_REPLACE, (c) => ESCAPES[c]);
 }
 
 const MARKS_RE = /\p{M}/gu;
@@ -23,16 +33,47 @@ const NON_ALNUM_RUN = /[^a-z0-9]+/g;
 const EDGE_DASH = /^-+|-+$/g;
 const TRAIL_DASH = /-+$/;
 /**
- * The slug of `text`: NFKD, combining marks dropped, A-Z lowered, every run of
- * characters other than a-z and 0-9 one "-", none at either end, at most 64
+ * The slug of an ASCII string, built in one char-code pass, or null when a
+ * non-ASCII character appears (the caller falls back to the full pipeline).
+ * Identical to the pipeline for ASCII input: NFKD is the identity there,
+ * there are no combining marks, A-Z lowers, every other-character run is one
+ * "-", none at either end, at most 64 characters with a "-" at the cut dropped.
+ */
+function slugAscii(text) {
+  let out = '';
+  let dashed = false;
+  let len = 0;
+  for (let i = 0; i < text.length && len < 64; i++) {
+    const c = text.charCodeAt(i);
+    if (c > 127) return null;
+    let ch;
+    if (c >= 65 && c <= 90) ch = c + 32;
+    else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) ch = c;
+    else ch = 45;
+    if (ch === 45) {
+      if (dashed || len === 0) continue;
+      dashed = true;
+    } else dashed = false;
+    out += String.fromCharCode(ch);
+    len++;
+  }
+  if (dashed) out = out.slice(0, -1);
+  return out;
+}
+/**
+ * The slug of `text`: NFKD, combining marks dropped, A-Z lowered, every run
+ * of characters other than a-z and 0-9 one "-", none at either end, at most 64
  * characters (a "-" left at the cut dropped), "untitled" when nothing is left.
  * `cache` is the build's per-case slug cache.
  */
 function slugify(text, cache) {
   const hit = cache.get(text);
   if (hit !== undefined) return hit;
-  let out = text.normalize('NFKD').replace(MARKS_RE, '').toLowerCase().replace(NON_ALNUM_RUN, '-').replace(EDGE_DASH, '');
-  out = out.slice(0, 64).replace(TRAIL_DASH, '');
+  let out = slugAscii(text);
+  if (out === null) {
+    out = text.normalize('NFKD').replace(MARKS_RE, '').toLowerCase().replace(NON_ALNUM_RUN, '-').replace(EDGE_DASH, '');
+    out = out.slice(0, 64).replace(TRAIL_DASH, '');
+  }
   if (out === '') out = 'untitled';
   cache.set(text, out);
   return out;
@@ -55,12 +96,6 @@ function longDate(date) {
 /** Code-unit order (never the locale's). */
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
-/** The words of a body: its runs of characters other than whitespace. */
-function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m === null ? 0 : m.length;
-}
-
 const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
 
 /** `rel` from the directory `dir` of a source, or null when it climbs out of the root. */
@@ -74,6 +109,30 @@ function resolvePath(dir, rel) {
     } else parts.push(seg);
   }
   return parts.join('/');
+}
+
+/** JavaScript's White_Space set, as a table over code units (only the BMP matters here). */
+const WS = new Uint8Array(65536);
+for (const c of [9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279]) WS[c] = 1;
+
+/**
+ * The words of `lines` from `start`: runs of non-whitespace characters.
+ * A word cannot span lines (\n is whitespace), so the per-line counts sum.
+ */
+function countWords(lines, start) {
+  let n = 0;
+  for (let i = start; i < lines.length; i++) {
+    const line = lines[i];
+    let inWord = false;
+    for (let j = 0; j < line.length; j++) {
+      if (WS[line.charCodeAt(j)] === 1) inWord = false;
+      else if (!inWord) {
+        inWord = true;
+        n++;
+      }
+    }
+  }
+  return n;
 }
 
 // ---------------------------------------------------------------- front matter
@@ -145,9 +204,12 @@ function valueOf(key, raw) {
   }
 }
 
-/** A source's front matter and body: { data, body }, or { error }. */
-function parseFrontMatter(text) {
-  const lines = text.split('\n');
+/**
+ * A source's front matter from its `lines`: { data, start } where `start` is
+ * the first body line, or { error }. The lines array is shared with the
+ * Markdown renderer, so the body is never joined and split again.
+ */
+function parseFrontMatter(lines) {
   if (lines[0] !== '---') return { error: 'no front matter' };
   let close = -1;
   for (let i = 1; i < lines.length; i++) {
@@ -173,7 +235,7 @@ function parseFrontMatter(text) {
     data[key] = v.value;
   }
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
-  return { data, body: lines.slice(close + 1).join('\n') };
+  return { data, start: close + 1 };
 }
 
 // ---------------------------------------------------------------- Markdown
@@ -224,6 +286,8 @@ const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-
  * raw, with no escape call of its own.
  */
 const INLINE_TOKEN = /[&<>"'\\`*[]/g;
+/** A string with no escapable and no inline mark is already its own rendering. */
+const INLINE_PLAIN = /[&<>"'\\`*[]/;
 
 /** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from) {
@@ -266,6 +330,7 @@ function findSingleStar(s, from) {
 
 /** `s` rendered inline; `env.link(target)` is a link's href. */
 function inline(s, env) {
+  if (!INLINE_PLAIN.test(s)) return s;
   let out = '';
   let i = 0;
   const n = s.length;
@@ -360,18 +425,18 @@ function inline(s, env) {
 }
 
 /**
- * `src` rendered in one pass: its HTML (each block on its own lines, a "\n"
- * after the last), its table of contents (every level 2 and 3 heading) and its
- * excerpt (the first paragraph's inline HTML, or "").
+ * `lines` from `start` rendered in one pass: its HTML (each block on its own
+ * lines, a "\n" after the last), its table of contents (every level 2 and 3
+ * heading) and its excerpt (the first paragraph's inline HTML, or "").
+ * Blocks are collected and joined once instead of appended one by one.
  */
-function renderMarkdown(src, env, slugCache) {
-  const lines = src.split('\n');
+function renderMarkdown(lines, start, env, slugCache) {
   const n = lines.length;
   const ids = new Set();
   const toc = [];
+  const blocks = [];
   let excerpt = null;
-  let html = '';
-  let i = 0;
+  let i = start;
   while (i < n) {
     const line = lines[i];
     if (line === '') {
@@ -387,7 +452,7 @@ function renderMarkdown(src, env, slugCache) {
         while (i < n && !MD_FENCE_CLOSE.test(lines[i])) body.push(lines[i++]);
         i++;
         const cls = fence[1] === '' ? '' : ` class="language-${esc(fence[1])}"`;
-        html += `<pre><code${cls}>${body.length === 0 ? '' : `${esc(body.join('\n'))}\n`}</code></pre>\n`;
+        blocks.push(`<pre><code${cls}>${body.length === 0 ? '' : `${esc(body.join('\n'))}\n`}</code></pre>`);
         continue;
       }
     } else if (c === 35) {
@@ -395,14 +460,14 @@ function renderMarkdown(src, env, slugCache) {
       if (heading !== null) {
         const id = uniqueSlug(slugify(heading.text, slugCache), ids);
         const h = inline(heading.text, env);
-        html += `<h${heading.depth} id="${id}">${h}</h${heading.depth}>\n`;
+        blocks.push(`<h${heading.depth} id="${id}">${h}</h${heading.depth}>`);
         if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html: h });
         i++;
         continue;
       }
     } else if (c === 45 || c === 42) {
       if (MD_HR.test(line)) {
-        html += '<hr>\n';
+        blocks.push('<hr>');
         i++;
         continue;
       }
@@ -420,16 +485,16 @@ function renderMarkdown(src, env, slugCache) {
             i++;
           } else break;
         }
-        html += '<ul>\n';
-        for (const parts of items) html += `<li>${inline(parts.join('\n'), env)}</li>\n`;
-        html += '</ul>\n';
+        const lis = [];
+        for (const parts of items) lis.push(`<li>${inline(parts.join('\n'), env)}</li>`);
+        blocks.push(`<ul>\n${lis.join('\n')}\n</ul>`);
         continue;
       }
     } else if (c === 62) {
       const body = [];
       while (i < n && lines[i].charCodeAt(0) === 62) body.push(lines[i++].replace(/^> ?/, ''));
       const q = body.map(trimLine).filter((l) => l !== '');
-      html += q.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(q.join('\n'), env)}</p>\n</blockquote>\n`;
+      blocks.push(q.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(q.join('\n'), env)}</p>\n</blockquote>`);
       continue;
     } else if (c >= 48 && c <= 57) {
       const ordered = MD_ORDERED.exec(line);
@@ -447,9 +512,9 @@ function renderMarkdown(src, env, slugCache) {
             i++;
           } else break;
         }
-        html += start !== 1 ? `<ol start="${start}">\n` : '<ol>\n';
-        for (const parts of items) html += `<li>${inline(parts.join('\n'), env)}</li>\n`;
-        html += '</ol>\n';
+        const lis = [];
+        for (const parts of items) lis.push(`<li>${inline(parts.join('\n'), env)}</li>`);
+        blocks.push(`${start !== 1 ? `<ol start="${start}">` : '<ol>'}\n${lis.join('\n')}\n</ol>`);
         continue;
       }
     } else if (c === 32 || c === 9) {
@@ -463,9 +528,9 @@ function renderMarkdown(src, env, slugCache) {
     while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
     const p = inline(body.join('\n'), env);
     if (excerpt === null) excerpt = p;
-    html += `<p>${p}</p>\n`;
+    blocks.push(`<p>${p}</p>`);
   }
-  return { html, toc, excerpt: excerpt ?? '' };
+  return { html: blocks.length === 0 ? '' : `${blocks.join('\n')}\n`, toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- Templates
@@ -601,6 +666,8 @@ function lookup(vars, path) {
  * `nodes` rendered in the flat scope `vars` (a null-prototype object holding
  * the root values and the loop bindings in force; a loop saves the names it
  * binds and restores them after, so a lookup is one own-property test).
+ * A for-loop reuses one loop record for all its items — templates only read
+ * it, so mutating its fields per item is observationally identical — and
  * `ctx` holds the parsed templates and the include depth.
  */
 function renderNodes(nodes, vars, ctx, depth) {
@@ -629,9 +696,13 @@ function renderNodes(nodes, vars, ctx, depth) {
         const oldName = vars[n.name];
         const hadLoop = Object.hasOwn(vars, 'loop');
         const oldLoop = vars.loop;
+        const loop = { index: 0, first: true, last: false, length: xs.length };
+        vars.loop = loop;
         for (let k = 0; k < xs.length; k++) {
           vars[n.name] = xs[k];
-          vars.loop = { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length };
+          loop.index = k + 1;
+          loop.first = k === 0;
+          loop.last = k === xs.length - 1;
           out += renderNodes(n.body, vars, ctx, depth);
         }
         if (hadName) vars[n.name] = oldName;
@@ -681,24 +752,27 @@ export function build(input) {
   const bySource = new Map();
 
   // 1. Sources, in code-unit order of their paths; a source that is not .md is static.
+  //    Each source is split into lines once: front matter and Markdown share it.
   const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
-    else statics.push({ path: f.path, content: f.content });
+    if (f.path.endsWith('.md')) {
+      const text = f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content;
+      sources.push({ path: f.path, lines: text.split('\n') });
+    } else statics.push({ path: f.path, content: f.content });
   }
 
   // 2. Each source's front matter, in order; a refused source is reported and dropped, and so is a draft.
   const kept = [];
   for (const s of sources) {
-    const fm = parseFrontMatter(s.text);
+    const fm = parseFrontMatter(s.lines);
     if ('error' in fm) {
       report.push(`refused ${s.path}: ${fm.error}`);
       continue;
     }
     s.data = fm.data;
-    s.body = fm.body;
+    s.bodyStart = fm.start;
     s.post = s.path.startsWith('posts/');
     let own;
     for (const d of RESERVED) {
@@ -761,11 +835,11 @@ export function build(input) {
         return target;
       },
     };
-    const md = renderMarkdown(s.body, env, slugCache);
+    const md = renderMarkdown(s.lines, s.bodyStart, env, slugCache);
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
-    s.readingMinutes = Math.max(1, Math.ceil(wordsOf(s.body) / 200));
+    s.readingMinutes = Math.max(1, Math.ceil(countWords(s.lines, s.bodyStart) / 200));
   }
 
   // 5. The posts, newest first and then by slug; each post's newer and older neighbours.

@@ -1,4 +1,4 @@
-// sitegen-fast: the program the harness runs (node /bot/main.ts, node22).
+// sitegen-fast v2: the program the harness runs (node /bot/main.ts, node22).
 // It reads every case from /input/cases.json, answers each one alone with
 // run() from solve.js, and writes /output/answers.json: a JSON array of the
 // answers, one per case and in the cases' order. Outside a container

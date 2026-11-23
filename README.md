@@ -12,23 +12,24 @@ byte for byte. `main.ts` is the program the harness runs: it reads every case
 from `/input/cases.json`, answers each with `run`, and writes
 `/output/answers.json`.
 
-## How it is faster
+## How v2 is faster than v1
 
-The reference is a pipeline of small plugins over a build; this entry keeps
-its exact behaviour and removes its per-character and per-node overhead:
+v1 was already ~2.75x the baseline; v2 removes the overhead the profiler
+found in it, keeping every answer byte-identical:
 
-- **Markdown**: a single-pass block renderer with first-character dispatch
-  (a line is classified by its first character before any regex runs) and a
-  chunk-based inline scanner — plain text between two marks is escaped in
-  one call instead of one call per character.
-- **Slugs**: a regex pipeline with a per-case cache (titles, tag names and
-  heading texts repeat across a site).
-- **Templates**: parsed once per case and rendered by a flat-scope
-  interpreter — one scope object per render, loop bindings saved and
-  restored, so a path lookup is one own-property test instead of a
-  scope-chain walk.
-- **Cards**: a source's `reading_minutes` is counted once and shared by its
-  card and its page.
+- **esc()**: most values hold no escapable character, so one test returns
+  them untouched instead of running a replace over the whole text.
+- **inline()**: a string with no mark and no escapable is already its own
+  rendering, so it is returned as-is after one test.
+- **Slugs**: pure-ASCII text (nearly every title and heading) is slugged by
+  one char-code pass; the NFKD pipeline runs only on a non-ASCII character.
+- **One split per source**: front matter and Markdown share the same lines
+  array — no body is joined and split again — and `\r` is normalised only
+  when a source holds one.
+- **reading_minutes**: counted by a scan over the body's lines with a
+  whitespace table, instead of building a word array per source.
+- **Templates**: a for-loop reuses one loop record for all its items
+  instead of allocating one per item.
 
 ## Layout
 
