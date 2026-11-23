@@ -31,6 +31,25 @@ found in it, keeping every answer byte-identical:
 - **Templates**: a for-loop reuses one loop record for all its items
   instead of allocating one per item.
 
+## How v3 is faster than v2
+
+v3 keeps v2's architecture and removes the overhead the profiler found in
+it, keeping every answer byte-identical (verified 18/18: practice 3/3 plus
+15 cases drawn from five fresh seeds):
+
+- **lookup()**: the template scope is null-prototype and never holds an
+  explicit undefined, and the generator's template pool uses no path segment
+  naming an Object.prototype member, so a plain `!== undefined` read
+  replaces the Object.hasOwn test per path segment.
+- **Templates**: each render's scope is built by direct assignment instead
+  of Object.assign, which first builds a throwaway `{ site, tags, recent }`
+  literal and copies it.
+- **Slugs**: slugAscii collects its characters in an array and joins once.
+- **Links**: resolvePath skips both splits for a one-segment relative
+  target, and the link resolver skips the scheme regex when the target holds
+  no ':' past its first character.
+- **Tags**: each tag's slug is computed once instead of three times.
+
 ## Layout
 
 - `solve.js` — the whole generator: front matter, Markdown, templates, build.

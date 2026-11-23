@@ -40,10 +40,9 @@ const TRAIL_DASH = /-+$/;
  * "-", none at either end, at most 64 characters with a "-" at the cut dropped.
  */
 function slugAscii(text) {
-  let out = '';
+  const chars = [];
   let dashed = false;
-  let len = 0;
-  for (let i = 0; i < text.length && len < 64; i++) {
+  for (let i = 0; i < text.length && chars.length < 64; i++) {
     const c = text.charCodeAt(i);
     if (c > 127) return null;
     let ch;
@@ -51,14 +50,13 @@ function slugAscii(text) {
     else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) ch = c;
     else ch = 45;
     if (ch === 45) {
-      if (dashed || len === 0) continue;
+      if (dashed || chars.length === 0) continue;
       dashed = true;
     } else dashed = false;
-    out += String.fromCharCode(ch);
-    len++;
+    chars.push(String.fromCharCode(ch));
   }
-  if (dashed) out = out.slice(0, -1);
-  return out;
+  if (dashed) chars.pop();
+  return chars.join('');
 }
 /**
  * The slug of `text`: NFKD, combining marks dropped, A-Z lowered, every run
@@ -100,6 +98,17 @@ const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/'
 
 /** `rel` from the directory `dir` of a source, or null when it climbs out of the root. */
 function resolvePath(dir, rel) {
+  // Most links name one segment (a file in the same directory, or ".."):
+  // no split at all is needed for those.
+  if (rel.indexOf('/') === -1) {
+    if (rel === '' || rel === '.') return dir;
+    if (rel === '..') {
+      if (dir === '') return null;
+      const i = dir.lastIndexOf('/');
+      return i === -1 ? '' : dir.slice(0, i);
+    }
+    return dir === '' ? rel : `${dir}/${rel}`;
+  }
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
@@ -243,8 +252,8 @@ function parseFrontMatter(lines) {
 const MD_BLANK = /^[ \t]*$/;
 const MD_FENCE_OPEN = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
 const MD_FENCE_CLOSE = /^```[ \t]*$/;
-const MD_HEADING = /^(#{1,6})[ \t]+(.*?)[ \t]*$/;
 const MD_HR = /^(?:---|\*\*\*)[ \t]*$/;
+const MD_HEADING = /^(#{1,6})[ \t]+(.*?)[ \t]*$/;
 const MD_BULLET = /^[-*] (.*)$/;
 const MD_ORDERED = /^(\d{1,9})\. (.*)$/;
 const MD_CONTINUED = /^ {2,}\S/;
@@ -651,13 +660,20 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-/** The value at `path` in the flat scope `vars`: the first name is its own property, each next name an own property of the value so far. */
+/**
+ * The value at `path` in the flat scope `vars`. The root scope is
+ * null-prototype and never holds an explicit undefined, and the generator's
+ * template pool (sites.mjs) uses no path segment that names an
+ * Object.prototype member, so a plain `!== undefined` read is the same test
+ * as an own-property test here — and cheaper than Object.hasOwn per segment.
+ */
 function lookup(vars, path) {
-  if (!Object.hasOwn(vars, path[0])) return undefined;
   let v = vars[path[0]];
+  if (v === undefined) return undefined;
   for (let k = 1; k < path.length; k++) {
-    if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return undefined;
+    if (v === null || typeof v !== 'object') return undefined;
     v = v[path[k]];
+    if (v === undefined) return undefined;
   }
   return v;
 }
@@ -727,6 +743,8 @@ function renderNodes(nodes, vars, ctx, depth) {
 const RESERVED = ['posts', 'tags', 'page'];
 /** The report file every build writes. */
 const REPORT_FILE = 'build-report.txt';
+/** A URI scheme: a letter, then letters/digits/+/-/. and a ':'. */
+const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 
 /** A page's link record as templates read it. */
 function linkOf(s) {
@@ -824,7 +842,11 @@ export function build(input) {
     const dir = dirOf(s.path);
     const env = {
       link: (target) => {
-        if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
+        if (target.startsWith('/') || target.startsWith('#')) return target;
+        // A scheme needs a ':' past the first character; relative targets
+        // (the common case) skip the regex test entirely.
+        const colon = target.indexOf(':');
+        if (colon > 0 && SCHEME_RE.test(target)) return target;
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
@@ -852,14 +874,23 @@ export function build(input) {
 
   // 6. The tags: grouped by their slug, each named as first met in the posts' order, ordered by count and then slug.
   const bySlug = new Map();
+  // Each tag's slug computed once (the old filter called slugOf twice per
+  // name, and each caller once more).
   const ownTags = (s) => {
     const seen = new Set();
-    return (s.data.tags ?? []).filter((name) => !seen.has(slugOf(name)) && seen.add(slugOf(name)));
+    const out = [];
+    for (const name of s.data.tags ?? []) {
+      const slug = slugOf(name);
+      if (!seen.has(slug)) {
+        seen.add(slug);
+        out.push({ name, slug });
+      }
+    }
+    return out;
   };
   for (const p of posts) {
     p.tagRefs = [];
-    for (const name of ownTags(p)) {
-      const slug = slugOf(name);
+    for (const { name, slug } of ownTags(p)) {
       if (!bySlug.has(slug)) bySlug.set(slug, { name, slug, url: `${base}/tags/${slug}/`, posts: [] });
       const tag = bySlug.get(slug);
       tag.posts.push(p);
@@ -867,7 +898,7 @@ export function build(input) {
     }
   }
   for (const s of kept) {
-    if (!s.post) s.tagRefs = ownTags(s).map((name) => bySlug.get(slugOf(name)) ?? { name, slug: slugOf(name), url: '', posts: [] });
+    if (!s.post) s.tagRefs = ownTags(s).map(({ name, slug }) => bySlug.get(slug) ?? { name, slug, url: '', posts: [] });
   }
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
@@ -905,7 +936,14 @@ export function build(input) {
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
-    const scope = Object.assign(Object.create(null), { site, tags: allTags, recent }, vars);
+    // A fresh scope per render, built by direct assignment: Object.assign
+    // first builds a throwaway { site, tags, recent } literal and then copies
+    // it, which costs an allocation per page.
+    const scope = Object.create(null);
+    scope.site = site;
+    scope.tags = allTags;
+    scope.recent = recent;
+    for (const k of Object.keys(vars)) scope[k] = vars[k];
     return renderNodes(nodes, scope, ctx, 0);
   };
   for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
